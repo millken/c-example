@@ -24,7 +24,7 @@ static struct config {
 
 typedef struct event_ptr {
 	int fd;
-	int addr;
+	char addr[16];
 }event_ptr;
 
 static void usage() {
@@ -135,8 +135,9 @@ static int create_and_connect( char *host , int *epfd)
       struct event_ptr *ptr = event.data.ptr;
       bzero(ptr, sizeof(event_ptr));
       ptr->fd = sock;
-      printf("ptr:%p,host:%p ,%d\n", &ptr->ip,host, strlen(host));
-      strcpy(ptr->ip, host);
+      strcpy(ptr->addr, host);
+      //ptr->addr[strlen(host)] = '\0';
+      //printf("%s=%d\n", ptr->addr, strlen(host));
 
       //event.data.fd = ptr.fd;
       //event.data.ptr = &ptr;
@@ -235,6 +236,7 @@ void main(int argc, char* argv[])
 	char header_value[200];
 	char header[1024];
 	char header_tmp[232];
+  event_ptr * ptr;
 	
 	sprintf(header, "GET %s HTTP/1.1\r\n", cfg.path);
 	
@@ -263,13 +265,13 @@ void main(int argc, char* argv[])
 			count = epoll_wait(epfd, events, cfg.threads, 3000);
 			if(count == 0) break;
 		for(i=0;i<count;i++) {	
- 		event_ptr * ptr = (event_ptr*)(events[i].data.ptr);
-		printf("fd=%d ,ip=%s\n", ptr->fd, ptr->ip);
+ 		ptr = events[i].data.ptr;
+		printf("fd=%d ,ip=%s\n", ptr->fd, ptr->addr);
 	  if ((events[i].events & EPOLLERR) ||  (events[i].events & EPOLLHUP))
 	    {
               /* An error has occured on this fd, or the socket is not
                  ready for reading (why were we notified then?) */
-	      fprintf (stderr, "epoll error\n");
+	      fprintf (stderr, "epoll error %d\n", ptr->fd);
 	      close (ptr->fd);
 	      continue;
 	    }				
@@ -327,6 +329,7 @@ void main(int argc, char* argv[])
                printf("%s\n", buffer);
             }
          }
+         free(ptr);
          }			
 		}
 	}
