@@ -1,5 +1,6 @@
 /*
  * https://gist.github.com/jcaesar/3049542
+ * http://www.it165.net/os/html/201308/5868.html **
  */
 
 #include <stdio.h>
@@ -132,7 +133,7 @@ static int create_and_connect( char *host , int *epfd)
        * EPOLLERR : Error condition happened on the associated file descriptor. 
        * epoll_wait(2) will always wait for this event; it is not necessary to set it in events.
        */
-      event.events = EPOLLIN |  EPOLLERR |  EPOLLHUP | EPOLLET | EPOLLOUT ;
+      event.events = EPOLLIN |  EPOLLERR |  EPOLLHUP | EPOLLOUT ;
       //Edgvent.events = EPOLLOUT | EPOLLIN | EPOLLRDHUP | EPOLLERR;
       
       event.data.ptr = malloc(sizeof(event_ptr));
@@ -296,7 +297,7 @@ epoll_worker:
 			if(count == 0) break;
 		for(i=0;i<count;i++) {	
  		ptr = events[i].data.ptr;
-		//printf("count=%d,fd=%d ,ip=%s, events[i].events=%d\n", count, ptr->fd, ptr->addr, events[i].events);
+		printf("count=%d,fd=%d ,ip=%s, events[i].events=%d\n", count, ptr->fd, ptr->addr, events[i].events);
 	  if ((events[i].events & (EPOLLHUP |  EPOLLERR)) || strlen(ptr->addr) == 0)
 	    {
 	      close (ptr->fd);
@@ -316,6 +317,28 @@ epoll_worker:
             }
             else
             {
+              /*
+              int n = header_len;
+              while (n > 0) {
+                datacount = write(ptr->fd, header + header_len - n, n);
+                if (datacount < n) {
+                  if (datacount == -1 && errno != EAGAIN) {
+                    perror("write error");
+                  }
+                  break;
+                }
+                n -= datacount;
+              }
+                  
+                events[i].events = EPOLLIN |  EPOLLERR | EPOLLET;
+
+                if(epoll_ctl(epfd, EPOLL_CTL_MOD, ptr->fd, events) != 0)
+                {
+                   perror("epoll_ctl, modify socket");
+                   close(ptr->fd);
+                   continue;
+                }
+    */
                if((datacount = send(ptr->fd, header, header_len, 0)) < 0)
                {
                   perror("send failed");
@@ -350,15 +373,25 @@ epoll_worker:
             }
             else 
             {
-               memset(buffer,0x0,buffersize);
+              /*
 
+               int n = 0;
+               while ((datacount = read(ptr->fd, buffer + n, buffersize-1)) > 0) { 
+                n += datacount;
+              }
+              if (datacount == -1 && errno != EAGAIN) { 
+                perror("read error");
+              }
+              printf("%s\n", buffer);
+              */              
+               memset(buffer,0x0,buffersize);
                if((datacount = recv(ptr->fd, buffer, buffersize, 0)) < 0 )
                {
                   //fprintf (stderr, "[ %s->%d] recv failed : %s\n", ptr->addr, ptr->fd, strerror(errno));
                   //close(ptr->fd);
                   continue;
                }
- 
+
                char *http_status = substring(buffer, 9, 3);
                http_servername = substr(buffer, "Server: ", "\r\n");
                http_title = substr(buffer, "<title>", "</title>");
