@@ -1,3 +1,7 @@
+/*
+ * https://gist.github.com/jcaesar/3049542
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -89,6 +93,7 @@ static int create_and_connect( char *host , int *epfd)
 	
     if((hp = gethostbyname(host)) == NULL) {
        fprintf(stderr,"[NetTools] Invalid server name: %s\n", host);
+       return -1;
     }
     bcopy(hp->h_addr, &addr.sin_addr, hp->h_length);
     addr.sin_port = htons(cfg.port);
@@ -105,7 +110,7 @@ static int create_and_connect( char *host , int *epfd)
       && errno != EINPROGRESS)
    {
       // connect doesn't work, are we running out of available ports ? if yes, destruct the socket
-      if (errno == EAGAIN)
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
       {
          perror("connect is EAGAIN");
          close(sock);
@@ -127,7 +132,7 @@ static int create_and_connect( char *host , int *epfd)
        * EPOLLERR : Error condition happened on the associated file descriptor. 
        * epoll_wait(2) will always wait for this event; it is not necessary to set it in events.
        */
-      event.events = EPOLLOUT | EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLET ;
+      event.events = EPOLLIN |  EPOLLERR |  EPOLLHUP | EPOLLET | EPOLLOUT ;
       //Edgvent.events = EPOLLOUT | EPOLLIN | EPOLLRDHUP | EPOLLERR;
       
       event.data.ptr = malloc(sizeof(event_ptr));
@@ -137,10 +142,6 @@ static int create_and_connect( char *host , int *epfd)
       ptr->fd = sock;
       strcpy(ptr->addr, host);
       //ptr->addr[strlen(host)] = '\0';
-      //printf("%s=%d\n", ptr->addr, strlen(host));
-
-      //event.data.fd = ptr.fd;
-      //event.data.ptr = &ptr;
 
       // add the socket to the epoll file descriptors
       if(epoll_ctl((int)*epfd, EPOLL_CTL_ADD, sock, &event) != 0)
@@ -183,6 +184,32 @@ void stringlink(char *s, char *t)
     *s = '\0';
 }
 
+char* substring(const char* str, size_t begin, size_t len)
+{
+  if (str == 0 || strlen(str) == 0 || strlen(str) < begin || strlen(str) < (begin+len))
+    return 0;
+
+  return strndup(str + begin, len);
+} 
+
+char *substr(char *haystack, char *begin, char *end)
+{
+   char *ret, *r;
+   char *b = strstr(haystack, begin);
+   if (b) {
+   	char *e = strstr(b, end);
+      if(e) {
+      	int offset = e - b;
+      	int retlen = offset - strlen(begin);
+		  if ((ret = malloc(retlen + 1)) == NULL)
+			return NULL;      	
+      	  strncpy(ret, b + strlen(begin), retlen);
+      	return ret;
+      }
+   }
+   return NULL;
+}
+
 void main(int argc, char* argv[])
 {
 	char *url, **headers;
@@ -193,6 +220,13 @@ void main(int argc, char* argv[])
         exit(1);
     }
 
+    char **h;
+	char header_name[32];
+	char header_value[200];
+	char header[1024];
+	char header_tmp[232];
+  event_ptr * ptr;
+  
 	if (cfg.file) {
 		FILE *fp;
 		char buf[MAX_LINE];  /*缓冲区*/
@@ -205,7 +239,6 @@ void main(int argc, char* argv[])
 		n = 0;
 		int epfd;
 		static struct epoll_event *events;
-		static struct epoll_event event_mask;
 
 		// create the special epoll file descriptor
 		epfd = epoll_create(cfg.threads);
@@ -216,30 +249,26 @@ void main(int argc, char* argv[])
 		  perror("calloc events");
 		  exit(1);
 		};
-   				
+		int rn = 0;	
+master_worker:		
 		while(fgets(buf, MAX_LINE, fp) != NULL) {
 			len = strlen(buf);
 			buf[len-1] = '\0'; /* 去掉换行符 */
-			printf("%s %d\n", buf, len -1);
 			  if(create_and_connect(buf, &epfd) != 0)
 			  {
-				 perror("create and connect");
-				 exit(1);
+				 fprintf (stderr, "create and connect : %s\n", buf);
 			  }			
 			++n;
+			++rn;
+			if(rn > cfg.threads) goto epoll_worker;
 		}
+		if (rn == 0) exit(0);
 		
-		
-  
-    char **h;
-	char header_name[32];
-	char header_value[200];
-	char header[1024];
-	char header_tmp[232];
-  event_ptr * ptr;
+
+epoll_worker:
 	
 	sprintf(header, "GET %s HTTP/1.1\r\n", cfg.path);
-	
+	rn = 0;
 	for (h = headers; *h; h++) {
 		char *p = strchr(*h, ':');
 		if (p && p[1] == ' ') {
@@ -254,25 +283,26 @@ void main(int argc, char* argv[])
 		}
 	}
 	stringlink(header, "\r\n");
-	printf("header: \n%s\n", header);
 	int header_len = strlen(header);
 	
    char buffer[1025];
    int buffersize = 1024;
    int count, i, datacount;	
-	
-		while(1) {
+   int http_status;
+  char *http_servername = NULL;
+   char *http_title = NULL;
+   	while(1) {
 			count = epoll_wait(epfd, events, cfg.threads, 3000);
 			if(count == 0) break;
 		for(i=0;i<count;i++) {	
  		ptr = events[i].data.ptr;
-		printf("fd=%d ,ip=%s\n", ptr->fd, ptr->addr);
-	  if ((events[i].events & EPOLLERR) ||  (events[i].events & EPOLLHUP))
+		//printf("count=%d,fd=%d ,ip=%s, events[i].events=%d\n", count, ptr->fd, ptr->addr, events[i].events);
+	  if ((events[i].events & (EPOLLHUP |  EPOLLERR)) || strlen(ptr->addr) == 0)
 	    {
-              /* An error has occured on this fd, or the socket is not
-                 ready for reading (why were we notified then?) */
-	      fprintf (stderr, "epoll error %d\n", ptr->fd);
 	      close (ptr->fd);
+          epoll_ctl(epfd, EPOLL_CTL_DEL, ptr->fd, NULL);
+
+	      //fprintf (stderr, "epoll error %d\n", ptr->fd);
 	      continue;
 	    }				
          if (events[i].events & EPOLLOUT) //socket is ready for writing
@@ -281,6 +311,7 @@ void main(int argc, char* argv[])
             if(socket_check(ptr->fd) != 0)
             {
                perror("write socket_check");
+               close(ptr->fd);
                continue;
             }
             else
@@ -288,50 +319,61 @@ void main(int argc, char* argv[])
                if((datacount = send(ptr->fd, header, header_len, 0)) < 0)
                {
                   perror("send failed");
+                  close(ptr->fd);
                   continue;
                }
                else
                {
-                  /* we just wrote on this socket, we don't want to write on it anymore
-                   * but we still want to read on it, so we modify the event mask to
-                   * remove EPOLLOUT from the events list
-                   */
-                  event_mask.events = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLET;
-                  event_mask.data.fd = ptr->fd;
+                  
+                  events[i].events = EPOLLIN |  EPOLLERR | EPOLLET;
 
-                  if(epoll_ctl(epfd, EPOLL_CTL_MOD, ptr->fd, &event_mask) != 0)
+                  if(epoll_ctl(epfd, EPOLL_CTL_MOD, ptr->fd, events) != 0)
                   {
-                     perror("epoll_ctl, modify socket\n");
-                     exit(1);
+                     perror("epoll_ctl, modify socket");
+                     close(ptr->fd);
+                     continue;
                   }
 
                }
             }
          }
 
-         if (events[i].events & EPOLLIN) //socket is ready for reading
+         if (events[i].events & (EPOLLIN )) //socket is ready for reading
          {
             // verify the socket is connected and doesn't return an error
             if(socket_check(ptr->fd) != 0)
             {
-               perror("read socket_check");
-               continue;
+               fprintf (stderr, " [ %s->%d] read socket_check : [%d]%s\n", ptr->addr, ptr->fd, errno, strerror(errno));
+               close(ptr->fd);
+               epoll_ctl(epfd, EPOLL_CTL_DEL, ptr->fd, NULL);
+               exit(1);
             }
             else 
             {
                memset(buffer,0x0,buffersize);
 
-               if((datacount = recv(ptr->fd, buffer, buffersize, 0)) < 0)
+               if((datacount = recv(ptr->fd, buffer, buffersize, 0)) < 0 )
                {
-                  perror("recv failed");
+                  //fprintf (stderr, "[ %s->%d] recv failed : %s\n", ptr->addr, ptr->fd, strerror(errno));
+                  //close(ptr->fd);
                   continue;
                }
-               printf("%s\n", buffer);
+ 
+               char *http_status = substring(buffer, 9, 3);
+               http_servername = substr(buffer, "Server: ", "\r\n");
+               http_title = substr(buffer, "<title>", "</title>");
+               fprintf (stdout, "%s\t%s\t%s\t%s\n", ptr->addr, http_status, http_servername, http_title);
+               if(http_status != NULL) free(http_status);
+               //if(http_servername != NULL) free(http_servername);
+               //if(http_title != NULL) free(http_title); 
+               close(ptr->fd);
+               epoll_ctl(epfd, EPOLL_CTL_DEL, ptr->fd, NULL);
             }
          }
-         free(ptr);
+         close(ptr->fd);
          }			
 		}
+		goto master_worker;
 	}
 	
     //printf("headers: %s\npath: %s\nport: %d\n", *headers, cfg.path, cfg.port);
