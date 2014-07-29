@@ -29,6 +29,7 @@ static struct config {
 
 typedef struct event_ptr {
 	int fd;
+	int rein;
 	char addr[16];
 }event_ptr;
 
@@ -114,7 +115,7 @@ static int create_and_connect( char *host , int *epfd)
       if (errno == EAGAIN || errno == EWOULDBLOCK)
       {
          perror("connect is EAGAIN");
-         close(sock);
+         //close(sock);
          exit(1);
       }
    }
@@ -133,14 +134,15 @@ static int create_and_connect( char *host , int *epfd)
        * EPOLLERR : Error condition happened on the associated file descriptor. 
        * epoll_wait(2) will always wait for this event; it is not necessary to set it in events.
        */
-      event.events = EPOLLIN |  EPOLLERR |  EPOLLHUP | EPOLLOUT ;
-      //Edgvent.events = EPOLLOUT | EPOLLIN | EPOLLRDHUP | EPOLLERR;
+      event.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLERR | EPOLLET;
+      //Edgvent.events = EPOLLOUT | EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLET;
       
       event.data.ptr = malloc(sizeof(event_ptr));
       
       struct event_ptr *ptr = event.data.ptr;
       bzero(ptr, sizeof(event_ptr));
       ptr->fd = sock;
+      ptr->rein = 0;
       strcpy(ptr->addr, host);
       //ptr->addr[strlen(host)] = '\0';
 
@@ -255,7 +257,7 @@ master_worker:
 		while(fgets(buf, MAX_LINE, fp) != NULL) {
 			len = strlen(buf);
 			buf[len-1] = '\0'; /* 去掉换行符 */
-			  if(create_and_connect(buf, &epfd) != 0)
+			  if(strlen(buf) >= 7 && create_and_connect(buf, &epfd) != 0)
 			  {
 				 fprintf (stderr, "create and connect : %s\n", buf);
 			  }			
@@ -285,22 +287,26 @@ epoll_worker:
 	}
 	stringlink(header, "\r\n");
 	int header_len = strlen(header);
+	char *hhh  = malloc( header_len * sizeof(char) + 1);
+	strcpy(hhh, header);
+
+	printf("%s", hhh);
 	
-   char buffer[1025];
-   int buffersize = 1024;
+   char buffer[2049];
+   int buffersize = 2048;
    int count, i, datacount;	
    int http_status;
   char *http_servername = NULL;
    char *http_title = NULL;
    	while(1) {
-			count = epoll_wait(epfd, events, cfg.threads, 3000);
+			count = epoll_wait(epfd, events, cfg.threads, 500);
 			if(count == 0) break;
 		for(i=0;i<count;i++) {	
  		ptr = events[i].data.ptr;
-		printf("count=%d,fd=%d ,ip=%s, events[i].events=%d\n", count, ptr->fd, ptr->addr, events[i].events);
+		//printf("count=%d,fd=%d ,ip=%s, events[i].events=%d\n", count, ptr->fd, ptr->addr, events[i].events);
 	  if ((events[i].events & (EPOLLHUP |  EPOLLERR)) || strlen(ptr->addr) == 0)
 	    {
-	      close (ptr->fd);
+
           epoll_ctl(epfd, EPOLL_CTL_DEL, ptr->fd, NULL);
 
 	      //fprintf (stderr, "epoll error %d\n", ptr->fd);
@@ -312,52 +318,34 @@ epoll_worker:
             if(socket_check(ptr->fd) != 0)
             {
                perror("write socket_check");
-               close(ptr->fd);
                continue;
             }
             else
             {
-              /*
-              int n = header_len;
-              while (n > 0) {
-                datacount = write(ptr->fd, header + header_len - n, n);
-                if (datacount < n) {
-                  if (datacount == -1 && errno != EAGAIN) {
-                    perror("write error");
-                  }
-                  break;
-                }
-                n -= datacount;
-              }
-                  
-                events[i].events = EPOLLIN |  EPOLLERR | EPOLLET;
-
-                if(epoll_ctl(epfd, EPOLL_CTL_MOD, ptr->fd, events) != 0)
-                {
-                   perror("epoll_ctl, modify socket");
-                   close(ptr->fd);
-                   continue;
-                }
-    */
-               if((datacount = send(ptr->fd, header, header_len, 0)) < 0)
-               {
-                  perror("send failed");
-                  close(ptr->fd);
-                  continue;
-               }
-               else
-               {
-                  
-                  events[i].events = EPOLLIN |  EPOLLERR | EPOLLET;
+              
+              int total = header_len;
+              while(1) {
+              	datacount = send(ptr->fd, hhh, header_len, 0);
+              	if(datacount < 0) {
+              		if (errno == EINTR || errno == EAGAIN) {
+              			usleep(1000);
+              			continue;
+              		} 
+              	}
+              	if (datacount == total) {
+                  events[i].events = EPOLLIN  | EPOLLHUP | EPOLLERR;
 
                   if(epoll_ctl(epfd, EPOLL_CTL_MOD, ptr->fd, events) != 0)
                   {
                      perror("epoll_ctl, modify socket");
-                     close(ptr->fd);
                      continue;
                   }
+                  break;           	
+              	}
+              	total -= datacount;
+              	hhh += datacount;
+              }
 
-               }
             }
          }
 
@@ -367,43 +355,63 @@ epoll_worker:
             if(socket_check(ptr->fd) != 0)
             {
                fprintf (stderr, " [ %s->%d] read socket_check : [%d]%s\n", ptr->addr, ptr->fd, errno, strerror(errno));
-               close(ptr->fd);
-               epoll_ctl(epfd, EPOLL_CTL_DEL, ptr->fd, NULL);
-               exit(1);
+               //epoll_ctl(epfd, EPOLL_CTL_DEL, ptr->fd, NULL);
+               continue;
+
             }
             else 
             {
-              /*
+               memset(buffer,0x0,buffersize);
 
                int n = 0;
-               while ((datacount = read(ptr->fd, buffer + n, buffersize-1)) > 0) { 
+               while (1) {
+               datacount = read(ptr->fd, buffer +n , buffersize);
+		      	if(datacount == -1) {
+		      		++ptr->rein;
+		      		if (ptr->rein > 5) {
+		      			epoll_ctl(epfd, EPOLL_CTL_DEL, ptr->fd, NULL);
+		      			break;
+		      		}
+		      		if (errno == EAGAIN) {
+		      			usleep(1000);
+		      			continue;
+		      		}
+		      	
+
+		      	}else if(datacount == 0) {
+		      		break;
+		      	}
+              //printf("%s=%d=%d\n", buffer, n, datacount);
+		      	               
                 n += datacount;
               }
-              if (datacount == -1 && errno != EAGAIN) { 
-                perror("read error");
-              }
-              printf("%s\n", buffer);
-              */              
-               memset(buffer,0x0,buffersize);
+
+
+              /*            
                if((datacount = recv(ptr->fd, buffer, buffersize, 0)) < 0 )
                {
-                  //fprintf (stderr, "[ %s->%d] recv failed : %s\n", ptr->addr, ptr->fd, strerror(errno));
-                  //close(ptr->fd);
+               	  ++ptr->rein;
+                  fprintf (stderr, "[ %s->%d] recv failed : %s\n", ptr->addr, ptr->fd, strerror(errno));
+                  if(ptr->rein > 5) {
+                  	epoll_ctl(epfd, EPOLL_CTL_DEL, ptr->fd, NULL);
+                  }
                   continue;
                }
-
+              */  
+				printf("%s\n", buffer);
                char *http_status = substring(buffer, 9, 3);
                http_servername = substr(buffer, "Server: ", "\r\n");
                http_title = substr(buffer, "<title>", "</title>");
                fprintf (stdout, "%s\t%s\t%s\t%s\n", ptr->addr, http_status, http_servername, http_title);
                if(http_status != NULL) free(http_status);
-               //if(http_servername != NULL) free(http_servername);
-               //if(http_title != NULL) free(http_title); 
-               close(ptr->fd);
+               if(http_servername != NULL) free(http_servername);
+               if(http_title != NULL) free(http_title); 
+
                epoll_ctl(epfd, EPOLL_CTL_DEL, ptr->fd, NULL);
+               //usleep(10000);
             }
          }
-         close(ptr->fd);
+
          }			
 		}
 		goto master_worker;
