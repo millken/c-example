@@ -9,69 +9,107 @@
 #include <fcntl.h>
 #include <sys/epoll.h>
 #include <errno.h>
+#include <signal.h>
 
 #define MAX_LINE 1024
 #ifndef EPOLLRDHUP
 #define EPOLLRDHUP 0x2000
 #endif
+
+#ifdef DEBUG
+
+void *
+debug_malloc(size_t size, const char *file, int line, const char *func)
+{
+        void *p;
+
+        p = malloc(size);
+        printf("%s:%d:%s:malloc(%ld): p=0x%lx\n",
+            file, line, func, size, (unsigned long)p);
+        return p;
+}
+
+#define malloc(s) debug_malloc(s, __FILE__, __LINE__, __func__)
+#define free(p)  do {                                                   \
+        printf("%s:%d:%s:free(0x%lx)\n", __FILE__, __LINE__,            \
+            __func__, (unsigned long)p);                                \
+        free(p);                                                        \
+} while (0)
+
+#endif
 static struct config {
-    char *path;
+    char *body;
     char *file; 
+    char *servername;
+    char *title;
     int port;
     int threads;
     bool dynamic;
 } cfg;
 
-typedef struct event_ptr {
+typedef struct se_ptr_s se_ptr_t;
+typedef int (*se_rw_proc_t)(se_ptr_t *ptr);
+
+struct se_ptr_s {
     int loop_fd;
     int fd;
+    se_rw_proc_t rfunc;
+    se_rw_proc_t wfunc;    
     char addr[16];
-}event_ptr;
+};
 
 static struct epoll_event events[4096], ev;
 
+
 static void usage() {
-    printf("Usage: httpv <options> <url> \n"
+    printf("Usage: httpv <options> \n"
            " Options: \n"
-           " -p, --path <P> path of url \n"
+           " -b, --body <b> data for socket, default <'GET / HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n'> \n"
            " -P, --port <P> port of host \n"
            " -t, --threads <N> Number of threads to use \n"
-           " \n"
            " -f, --file <F> Load ip file \n"
-           " -H, --header <H> Add header to request \n"
+           " -0, --title <T> match title \n"
+           " -1, --servername <S> match server \n"
            " \n");
 }
-static int parse_args(struct config *cfg, char **headers, int argc, char* argv[])
+static int parse_args(struct config *cfg,  int argc, char* argv[])
 {
-    char **header = headers;
     int c;
     memset(cfg, 0, sizeof(struct config));
-    cfg->path = "/";
+    cfg->body = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
     cfg->port = 80;
     cfg->file = NULL;
     cfg->dynamic = false;
     cfg->threads = 1000;
+    cfg->servername = NULL;
+    cfg->title = NULL;
 
-    while ((c = getopt(argc, argv, "f:P:p:t:H:d:h?")) != -1) {
+    while ((c = getopt(argc, argv, "0:1:f:P:b:t:d:h?")) != -1) {
         switch (c) {
         case 'f':
             cfg->file = optarg;
             break;
         case 'P': cfg->port = atoi(optarg); break;
         case 't': cfg->threads = atoi(optarg); break;        
-        case 'p': cfg->path = optarg; break;
-        case 'H':
-            *header++ = optarg;
-            break;
+        case 'b': cfg->body = optarg; break;
+        case '0': cfg->title = optarg; break;
+        case '1': cfg->servername = optarg; break;
         case 'h':
         case '?':
         default:
             return -1;
         }
     }
-    *header = NULL;
     return 0;
 }
+
+char* substring(const char* str, size_t begin, size_t len)
+{
+  if (str == 0 || strlen(str) == 0 || strlen(str) < begin || strlen(str) < (begin+len))
+    return 0;
+
+  return strndup(str + begin, len);
+} 
 
 char *substr(char *haystack, char *begin, char *end)
 {
@@ -83,7 +121,8 @@ char *substr(char *haystack, char *begin, char *end)
         int offset = e - b;
         int retlen = offset - strlen(begin);
           if ((ret = malloc(retlen + 1)) == NULL)
-            return NULL;        
+            return NULL;
+            ret[retlen] = '\0';
           strncpy(ret, b + strlen(begin), retlen);
         return ret;
       }
@@ -134,16 +173,18 @@ static int connected( char *host)
     }
     // set socket to non blocking and allow port reuse
     if ( (setsockopt(sock,SOL_SOCKET,SO_REUSEADDR,&on,sizeof(int)) ||
-      fcntl(sock, F_SETFL, O_NONBLOCK)) == -1)
+      !setnonblocking(sock)))
     {
       fprintf(stderr, "setsockopt || fcntl");
       return -2;
     }    
     int res = connect(sock, (struct sockaddr *)&addr, sizeof(struct sockaddr));
+
     if (res < 0) {
         if (errno == EINPROGRESS) {
-            return -7;
+            return sock;
         }
+        close(sock);
         return -3;
     }
    return sock;    
@@ -167,9 +208,9 @@ int se_create(int event_size)
     return epoll_create(event_size);
 }
 
-event_ptr *se_add(int loop_fd, int fd)
+se_ptr_t *se_add(int loop_fd, int fd)
 {
-    event_ptr *ptr = malloc(sizeof(event_ptr));
+    se_ptr_t *ptr = malloc(sizeof(se_ptr_t));
 
     if(!ptr) {
         return ptr;
@@ -190,7 +231,7 @@ event_ptr *se_add(int loop_fd, int fd)
     return ptr;
 }
 
-int se_delete(event_ptr *ptr)
+int se_delete(se_ptr_t *ptr)
 {
     if(!ptr) {
         return -1;
@@ -208,24 +249,30 @@ int se_delete(event_ptr *ptr)
 int se_loop(int loop_fd, int waitout)
 {
     int n = 0, i = 0;
-    event_ptr *ptr = NULL;
+    se_ptr_t *ptr = NULL;
 
     while(1) {
 
         n = epoll_wait(loop_fd, events, 4096, waitout);
-
+        if(n == 0) break;
         for(i = 0; i < n; i++) {
             ptr = events[i].data.ptr;
 
-            if(events[i].events & (EPOLLIN | EPOLLHUP | EPOLLERR)) {
-                printf("%s\n", "EPOLLIN");
+            if (events[i].events & ( EPOLLHUP | EPOLLERR))
+            {
+                se_delete(ptr);
+            } else if(events[i].events & (EPOLLIN) && ptr->rfunc) {
+                //printf("rfunc\n");
+                ptr->rfunc(ptr);
 
-            } else if(events[i].events & (EPOLLOUT | EPOLLHUP | EPOLLERR)) {
-                printf("%s\n", "EPOLLOUT");
+            } else if(events[i].events & (EPOLLOUT) && ptr->wfunc) {
+                //printf("wfunc\n");
+                ptr->wfunc(ptr);
             }
         }
 
         if(n == -1 && errno != EINTR) {
+            printf("exit\n");
             break;
         }
     }
@@ -233,16 +280,127 @@ int se_loop(int loop_fd, int waitout)
     return 0;
 }
 
+int se_be_read(se_ptr_t *ptr, se_rw_proc_t func)
+{
+    ptr->rfunc = func;
+    ptr->wfunc = NULL;
+
+    ev.data.ptr = ptr;
+    ev.events = EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
+
+    return epoll_ctl(ptr->loop_fd, EPOLL_CTL_MOD, ptr->fd, &ev);
+}
+
+int se_be_write(se_ptr_t *ptr, se_rw_proc_t func)
+{
+    ptr->rfunc = NULL;
+    ptr->wfunc = func;
+
+    ev.data.ptr = ptr;
+    ev.events = EPOLLOUT | EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
+
+    return epoll_ctl(ptr->loop_fd, EPOLL_CTL_MOD, ptr->fd, &ev);
+}
+
+int se_be_pri(se_ptr_t *ptr, se_rw_proc_t func)
+{
+    ptr->rfunc = func;
+    ptr->wfunc = NULL;
+
+    ev.data.ptr = ptr;
+    ev.events = EPOLLPRI;
+
+    return epoll_ctl(ptr->loop_fd, EPOLL_CTL_MOD, ptr->fd, &ev);
+}
+
+int se_be_rw(se_ptr_t *ptr, se_rw_proc_t rfunc, se_rw_proc_t wfunc)
+{
+    ptr->rfunc = rfunc;
+    ptr->wfunc = wfunc;
+
+    ev.data.ptr = ptr;
+    ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLHUP | EPOLLERR;
+
+    return epoll_ctl(ptr->loop_fd, EPOLL_CTL_MOD, ptr->fd, &ev);
+}
+
+int network_be_read(se_ptr_t *ptr)
+{
+    char *buffer;
+    int n = 0;
+    buffer = malloc(4096);
+    if (socket_check(ptr->fd) == 1)
+    {
+        fprintf (stderr, " [ %s->%d] read socket_check : [%d]%s\n", ptr->addr, ptr->fd, errno, strerror(errno));
+        //se_be_read(ptr, network_be_read);
+        free(buffer);
+        return 1;
+    }    
+    ssize_t nread = 0;
+    while ((nread = read(ptr->fd, buffer +n , 4096)) > 0) {
+        //printf("n=%d,nread=%d\n", n, nread);            
+        n += nread;
+        if (nread >= 4096) {
+            char *_t = (char *) realloc(buffer, n + 4096);
+
+            if(_t != NULL) {
+                buffer = _t;
+            }            
+        }
+    }    
+     if(n > 0) {
+        int m0 = 0;
+        int m1 = 0;
+        buffer[n] = '\0';
+        //printf("read %d=%d: %s\n", n, nread, buffer);
+        char *http_status = substring(buffer, 9, 3);
+        char *http_servername = substr(buffer, "Server: ", "\r\n");
+        char *http_title = substr(buffer, "<title>", "</title>");
+        if (cfg.title != NULL) {
+            ++m0;
+            if (http_title != NULL && strstr(http_title, cfg.title) != NULL)++m1;
+        }
+        if (cfg.servername != NULL) {
+            ++m0;
+            if (http_servername != NULL && strstr(http_servername, cfg.servername) != NULL)++m1;
+        }  
+
+        if( m0 == m1)fprintf(stdout, "%s\t%s\t%s\t%s\n", ptr->addr, http_status, http_servername, http_title);
+        if(http_status != NULL) free(http_status);
+        if(http_servername != NULL) free(http_servername);
+        if(http_title != NULL) free(http_title);     
+    }
+    free(buffer);
+    close(ptr->fd);
+    se_delete(ptr);
+    return n;
+
+}
+int network_be_write(se_ptr_t *ptr)
+{
+    int rs;
+
+    if (socket_check(ptr->fd) == 1)
+    {
+        fprintf (stderr, " [ %s->%d] write socket_check : [%d]%s\n", ptr->addr, ptr->fd, errno, strerror(errno));
+        se_delete(ptr);
+        //se_be_write(ptr, network_be_write);
+        return 1;
+    }
+    rs = send(ptr->fd, cfg.body, strlen(cfg.body), 0);
+    if (rs < 0) {
+        printf("send error [%d]%s\n", errno, strerror(errno));
+        se_delete(ptr);
+        return 1;
+    }
+    se_be_read(ptr, network_be_read);
+
+}
 void main(int argc, char* argv[])
 {
-    char *url, **headers;
     int epfd;
-    char header[1024];
-
-    sprintf(header, "GET %s HTTP/1.1\r\nHost: %s\r\n\r\n", "/", "localhost");
-    headers = malloc((argc / 2) * sizeof(char *));
-    
-    if (parse_args(&cfg, headers, argc, argv)) {
+    signal(SIGPIPE, SIG_IGN); //oops strace 
+    if (parse_args(&cfg, argc, argv)) {
         usage();
         exit(1);
     }
@@ -257,6 +415,8 @@ void main(int argc, char* argv[])
         }
         n = 0;
         epfd = se_create(1024);
+        int rn = 0;
+master_worker:
         while(fgets(buf, MAX_LINE, fp) != NULL) {
             len = strlen(buf);
             buf[len-1] = '\0'; /* 去掉换行符 */
@@ -265,13 +425,22 @@ void main(int argc, char* argv[])
                 int sockfd = connected(buf);
                 if (sockfd > 0)
                 {
-                    event_ptr *ptr = se_add(epfd, sockfd);
+                    se_ptr_t *ptr = se_add(epfd, sockfd);
                     strcpy(ptr->addr, buf);
+                    se_be_write(ptr, network_be_write);
                 }
-                fprintf (stderr, "create and connect : %s=%d=%d\n", buf, sockfd, socket_check(sockfd));
+                //fprintf (stderr, "create and connect : %s=%d\n", buf, sockfd);
               }         
             ++n;
+            ++rn;
+            if(rn > cfg.threads) goto epoll_worker;
         }
-        se_loop(epfd, 5);
+        if (rn == 0) exit(0);
+ epoll_worker:
+        fprintf (stderr, "parse line: %d - %d\n", (n-cfg.threads) < 0 ? 1 : (n-cfg.threads), n);   
+        rn = 0;    
+        se_loop(epfd, 4000);
+        goto master_worker;
     }
+    fprintf (stderr, "parse done\n");
 }
