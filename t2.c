@@ -76,7 +76,7 @@ static int parse_args(struct config *cfg,  int argc, char* argv[])
 {
     int c;
     memset(cfg, 0, sizeof(struct config));
-    cfg->body = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    cfg->body = "GET / HTTP/1.1\r\nAccept-Encoding: deflate\r\nHost: www.baidu.com\r\n\r\n";
     cfg->port = 80;
     cfg->file = NULL;
     cfg->dynamic = false;
@@ -286,7 +286,7 @@ int se_be_read(se_ptr_t *ptr, se_rw_proc_t func)
     ptr->wfunc = NULL;
 
     ev.data.ptr = ptr;
-    ev.events = EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
+    ev.events = EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLONESHOT;
 
     return epoll_ctl(ptr->loop_fd, EPOLL_CTL_MOD, ptr->fd, &ev);
 }
@@ -326,32 +326,36 @@ int se_be_rw(se_ptr_t *ptr, se_rw_proc_t rfunc, se_rw_proc_t wfunc)
 
 int network_be_read(se_ptr_t *ptr)
 {
-    char *buffer;
-    int n = 0;
-    buffer = malloc(4096);
+    char *response = NULL;
+    char buffer[1500];
+    int read_size , total_size = 0;
     if (socket_check(ptr->fd) == 1)
     {
         fprintf (stderr, " [ %s->%d] read socket_check : [%d]%s\n", ptr->addr, ptr->fd, errno, strerror(errno));
         //se_be_read(ptr, network_be_read);
-        free(buffer);
         return 1;
-    }    
-    ssize_t nread = 0;
-    while ((nread = read(ptr->fd, buffer +n , 4096)) > 0) {
-        //printf("n=%d,nread=%d\n", n, nread);            
-        n += nread;
-        if (nread >= 4096) {
-            char *_t = (char *) realloc(buffer, n + 4096);
-
-            if(_t != NULL) {
-                buffer = _t;
-            }            
-        }
-    }    
-     if(n > 0) {
+    }
+    bzero(buffer, 1500);
+	while( (read_size = recv(ptr->fd , buffer , sizeof(buffer) , 0) ))
+	{
+		if((errno == EINTR || errno == EWOULDBLOCK || errno == EAGAIN)) {
+			fprintf (stderr, " recv[%d] : [%d]%s\n",read_size, errno, strerror(errno));
+			continue;
+		}
+		response = realloc(response , read_size + total_size);
+		if(response == NULL)
+		{
+			printf("realloc failed");
+			exit(1);
+		}
+		memcpy((response + total_size) , buffer , read_size);
+		total_size += read_size;
+	}
+	response = realloc(response , total_size + 1);
+	*(response + total_size) = '\0';
+     if(total_size > 0) {
         int m0 = 0;
         int m1 = 0;
-        buffer[n] = '\0';
         //printf("read %d=%d: %s\n", n, nread, buffer);
         char *http_status = substring(buffer, 9, 3);
         char *http_servername = substr(buffer, "Server: ", "\r\n");
@@ -370,10 +374,10 @@ int network_be_read(se_ptr_t *ptr)
         if(http_servername != NULL) free(http_servername);
         if(http_title != NULL) free(http_title);     
     }
-    free(buffer);
+    if(response != NULL) free(response);
     close(ptr->fd);
     se_delete(ptr);
-    return n;
+    return total_size;
 
 }
 int network_be_write(se_ptr_t *ptr)
@@ -406,7 +410,7 @@ void main(int argc, char* argv[])
     }
     if (cfg.file) {
         FILE *fp;
-        char buf[MAX_LINE];  /*缓冲区*/
+        char buf[MAX_LINE];
         int n, len ;
         fp = fopen(cfg.file, "r");
         if (fp == NULL) {
@@ -419,7 +423,7 @@ void main(int argc, char* argv[])
 master_worker:
         while(fgets(buf, MAX_LINE, fp) != NULL) {
             len = strlen(buf);
-            buf[len-1] = '\0'; /* 去掉换行符 */
+            buf[len-1] = '\0';
               if(strlen(buf) >= 7)
               {
                 int sockfd = connected(buf);
@@ -437,10 +441,10 @@ master_worker:
         }
         if (rn == 0) exit(0);
  epoll_worker:
-        fprintf (stderr, "parse line: %d - %d\n", (n-cfg.threads) < 0 ? 1 : (n-cfg.threads), n);   
+        fprintf (stderr, "work line: %d - %d\n", (n-cfg.threads) < 0 ? 1 : (n-cfg.threads), n);   
         rn = 0;    
         se_loop(epfd, 4000);
         goto master_worker;
     }
-    fprintf (stderr, "parse done\n");
+    fprintf (stderr, "work done\n");
 }

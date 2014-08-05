@@ -1,0 +1,15 @@
+0x60f6c0,0
+HTTP/1.1 200 OK
+Server: hhhh
+Date: Tue, 05 Aug 2014 07:56:25 GMT
+Last-Modified: Sat, 27 Apr 2013 04:12:05 GMT
+Content-Type: text/html
+Content-Length: 155
+Connection: close
+
+<HTML><HEAD><meta http-equiv="content-type" content="text/html;charset=utf-8">
+<TITLE>301 Moved</TITLE></HEAD><BODY>
+<H1>Hello World!</H1>
+</BODY></HTML>
+
+
